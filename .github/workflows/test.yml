@@ -1,0 +1,268 @@
+# FIXME: https://github.com/orgs/community/discussions/50468#discussioncomment-5366823
+# This workflow won't trigger on a weights commit, which was pushed automatically from this workflow
+name: build-and-deploy
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - v*
+  workflow_dispatch:
+    inputs:
+      benchmark_type:
+        description: 'Benchmarking type'
+        type: choice
+        required: true
+        default: 'quick'
+        options:
+          - quick
+          - full
+      pallets_to_benchmark:
+        description: 'Comma-separated list of pallets to benchmark (optional)'
+        required: false
+        default: ''
+        type: string
+  pull_request:
+
+env:
+  RELAY_CHAIN_VERSION: v0.9.28
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - run: git describe --tags --abbrev=0
+      - name: Setup cmake
+        uses: jwlawson/actions-setup-cmake@v1.12
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Run tests
+        run: make test-release
+      - name: Build release
+        run: time make build-release
+      - name: Version info
+        run: ./target/release/hydradx --version
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: hydradx
+          path: target/release/hydradx
+      - name: Upload release wasm
+        uses: actions/upload-artifact@v4
+        with:
+          name: hydradx_runtime.compact.compressed.wasm
+          path: target/release/wbuild/hydradx-runtime/hydradx_runtime.compact.compressed.wasm
+      - name: Clippy
+        run: make clippy-all
+
+      - name: Build benchmarks CLI
+        id: build-benchmarks
+        run: make build-benchmarks
+
+      - name: Upload benchmarks CLI
+        uses: actions/upload-artifact@v4
+        with:
+          name: hydradx-bencher
+          path: target/release/hydradx
+
+  benchmark-check:
+    runs-on: ubuntu-latest
+    concurrency: benchmark-execution
+    needs: build
+    permissions:
+      pull-requests: write
+      actions: read
+      contents: write
+    steps:
+      - name: Check ignore benchmarks
+        id: check-ignore
+        run: |
+          if git log -1 --pretty=format:"%s" | grep -q "\[ignore benchmarks\]"; then
+            echo "ignore=true" >> $GITHUB_OUTPUT
+          else
+            echo "ignore=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Skip benchmarks
+        if: steps.check-ignore.outputs.ignore == 'true'
+        run: |
+          echo "Skipping benchmark-check job due to ignore tag"
+          exit 0
+
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Prepare benchmark execution
+        if: steps.check-ignore.outputs.ignore == 'false'
+        id: prepare
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "benchmark_type=${{ github.event.inputs.benchmark_type }}" >> $GITHUB_OUTPUT
+          else
+            echo "benchmark_type=quick" >> $GITHUB_OUTPUT
+          fi
+          
+          pr_number=${{ github.event.number }}
+          echo "pr_number=$pr_number" >> $GITHUB_OUTPUT
+          
+          if [[ -z "$pr_number" ]]; then
+            pr_number=$(curl -s \
+              -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${{ github.repository }}/pulls?head=${{ github.repository_owner }}:${{ github.head_ref }}&state=open" | \
+              grep '"number":' | \
+              sed 's/[^0-9]*//g' | \
+              head -n 1
+            )
+            echo "pr_number=$pr_number" >> $GITHUB_OUTPUT
+          
+            if [[ -z "$pr_number" ]]; then
+              echo "Warning: Could not determine PR number from either event context or API" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Setup cmake
+        uses: jwlawson/actions-setup-cmake@v1.12
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: '-D warnings'
+
+      - name: Download benchmarks CLI
+        uses: actions/download-artifact@v4
+        with:
+          name: hydradx-bencher
+          path: ./bin
+      - run: chmod +x ./bin/hydradx
+
+      - name: Run ${{ steps.prepare.outputs.benchmark_type }} benchmarks
+        run: |
+          BENCHMARK_FLAGS="--bin ./bin/hydradx"
+          if [[ "${{ steps.prepare.outputs.benchmark_type }}" == "quick" ]]; then
+            BENCHMARK_FLAGS="$BENCHMARK_FLAGS --check"
+          fi
+          if [ -z "${{ github.event.inputs.pallets_to_benchmark }}" ]; then
+            ./scripts/benchmarking.sh --all $BENCHMARK_FLAGS
+          else
+            ./scripts/benchmarking.sh "${{ github.event.inputs.pallets_to_benchmark }}" $BENCHMARK_FLAGS
+          fi
+
+      - name: Upload weights directory
+        id: bencher-weights
+        uses: actions/upload-artifact@v4
+        with:
+          name: quick-benchmark-weights
+          path: runtime/hydradx/src/weights/
+          retention-days: 3
+
+      - name: Check with new weights
+        run: make check
+
+      - name: Commit full benchmark results to a pull request
+        if: steps.prepare.outputs.benchmark_type == 'full'
+        run: |
+          user="${{ github.actor }}"
+          git config --global user.name "$user"
+          git config --global user.email "${user}@users.noreply.github.com"
+
+          # Add and check if there are changes
+          git add runtime/hydradx/src/weights/
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          # Commit changes
+          git commit -m "Update pallets weights [ignore benchmarks]"
+
+          # Set up authentication and push
+          # Create the authenticated URL with the token
+          repo_url="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+
+          # Push to the branch that triggered the workflow
+          git push "${repo_url}" HEAD:${{ github.head_ref || github.ref_name }}
+
+          echo "Successfully pushed benchmark results to branch ${{ github.head_ref || github.ref_name }}"
+
+      - name: Comment benchmark results to the pull request
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2.1.0
+        with:
+          header: 'benchmark'
+          recreate: true
+          number: ${{ steps.prepare.outputs.pr_number }}
+          message: |
+            ${{ steps.prepare.outputs.benchmark_type == 'full' && 'Full' || 'Quick' }} benchmark at commit ${{ github.event.pull_request.head.sha }} has been executed successfully.
+            [View results](${{ steps.bencher-weights.outputs.artifact-url }})
+
+  version-check:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    if: github.event_name == 'pull_request'
+    outputs:
+      runtime-upgraded: ${{ steps.check-runtime.outputs.upgraded }}
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Install Rust
+        uses: codota/toolchain@00a8bf2bdcfe93aefd70422d3dec07337959d3a4
+        with:
+          profile: minimal
+      - name: Get crate versions
+        run: |
+          VERSION_UPDATE=$(./scripts/list_crate_updates.sh)
+          VERSION_UPDATE=$(cat << EOF
+          $VERSION_UPDATE
+          EOF
+          )
+          echo "VERSION_UPDATE<<EOF" >> $GITHUB_ENV
+          echo "$VERSION_UPDATE" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+      - name: Check runtime upgrade
+        id: check-runtime
+        if: contains(env.VERSION_UPDATE, 'Runtime version has been increased.')
+        run: echo "::set-output name=upgraded::true"
+      - name: Sticky Pull Request Comment
+        uses: marocchino/sticky-pull-request-comment@v2.1.0
+        with:
+          message: |
+            ${{ env.VERSION_UPDATE }}
+      - name: Evaluate result
+        if: contains(env.VERSION_UPDATE, 'have not been updated') || contains(env.VERSION_UPDATE, 'versions don''t match') || contains(env.VERSION_UPDATE, 'downgraded')
+        run: exit 1
+
+  ecosystem-tests:
+    needs: build  # Make sure this runs after build job to have the wasm artifact
+    permissions: { }
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout polkadot-ecosystem-tests
+        uses: actions/checkout@v2
+        with:
+          repository: galacticcouncil/polkadot-ecosystem-tests
+          ref: hydration-ci-tests
+
+      - name: Download WASM artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: hydradx_runtime.compact.compressed.wasm
+
+      - name: Run ecosystem tests
+        run: |
+          # Set the path to the downloaded WASM file
+          export HYDRADX_RUNTIME_WASM_PATH="$PWD/hydradx_runtime.compact.compressed.wasm"
+
+          # Run specific tests doing XCM between hydradx and other parachains
+          yarn install
+          yarn test xcm.test.ts dca.test.ts
+        env:
+          HYDRADX_RUNTIME_WASM_PATH: ${{ env.HYDRADX_RUNTIME_WASM_PATH }}
